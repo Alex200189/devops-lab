@@ -1,0 +1,58 @@
+services:
+  app:
+    build: .
+    ports:
+      - "${APP_PORT}:8080"
+    env_file:
+      - .env
+    depends_on:
+      postgres:
+        condition: service_healthy
+      redis:
+        condition: service_healthy
+    healthcheck:
+      test: ["CMD", "curl", "-f", "http://localhost:8080/health"]
+    deploy:
+      resources:
+        limits:
+          cpus: '0.5'       
+          memory: 128M
+
+  postgres:
+    image: postgres:16-alpine
+    environment:
+      POSTGRES_USER: "${POSTGRES_USER}"
+      POSTGRES_PASSWORD: "${POSTGRES_PASSWORD}"
+      POSTGRES_DB: "${POSTGRES_DB}"
+      POSTGRES_PORT: "${POSTGRES_PORT}"
+    volumes:
+      - postgres_data:/var/lib/postgresql/data
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U $$POSTGRES_USER -d $$POSTGRES_DB"]
+      interval: 5s
+      timeout: 5s
+      retries: 5
+    deploy:
+      resources:
+        limits:
+          cpus: '0.5'       
+          memory: 256M
+
+  redis:
+    image: redis:alpine
+    environment:
+      REDIS_PASSWORD: "${REDIS_PASSWORD}"
+      REDIS_PORT: "${REDIS_PORT}"
+    healthcheck:
+      test: ["CMD", "redis-cli", "-a", "${REDIS_PASSWORD}", "ping"]
+      interval: 3s      
+      timeout: 1s       
+      retries: 2        
+      start_period: 1s
+    deploy:
+      resources:
+        limits:
+          cpus: '0.2'      
+          memory: 64M
+volumes:
+  postgres_data: 

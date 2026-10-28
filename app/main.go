@@ -1,113 +1,133 @@
 package main
 
 import (
+	"database/sql"
 	"encoding/json"
 	"fmt"
+	"log"
 	"net/http"
+	"os"
 	"strings"
-	"sync"
+	"time"
+
+	_ "github.com/jackc/pgx/v5/stdlib"
 )
 
-// Task представляет структуру задачи
 type Task struct {
 	ID    int    `json:"id"`
 	Title string `json:"title"`
 }
 
-// Хранилище в оперативной памяти (In-Memory) с поддержкой конкурентности
-var (
-	tasks       = []Task{}
-	nextID      = 1
-	tasksMu     sync.Mutex
-	tasksPathPrefix = "/tasks"
-)
+var db *sql.DB
 
 func main() {
-	mux := http.NewServeMux()
+	// DSN: host=postgres — это имя сервиса в docker-compose
+	dsn := fmt.Sprintf("postgres://%s:%s@postgres:5432/%s?sslmode=disable",
+		os.Getenv("POSTGRES_USER"),
+		os.Getenv("POSTGRES_PASSWORD"),
+		os.Getenv("POSTGRES_DB"),
+	)
 
-	// Регистрация эндпоинтов (синтаксис Go 1.22+)
+	var err error
+	db, err = sql.Open("pgx", dsn)
+	if err != nil {
+		log.Fatalf("open db: %v", err)
+	}
+
+	// Retry: ждём, пока Postgres поднимется
+	for i := 1; i <= 10; i++ {
+		if err = db.Ping(); err == nil {
+			log.Println("db connected")
+			break
+		}
+		log.Printf("db ping attempt %d/10 failed: %v", i, err)
+		time.Sleep(1 * time.Second)
+	}
+	if err != nil {
+		log.Fatalf("db not reachable: %v", err)
+	}
+
+	// Создаём таблицу, если её нет
+	_, err = db.Exec(`CREATE TABLE IF NOT EXISTS tasks (
+		id SERIAL PRIMARY KEY,
+		title TEXT NOT NULL
+	)`)
+	if err != nil {
+		log.Fatalf("create table: %v", err)
+	}
+
+	mux := http.NewServeMux()
 	mux.HandleFunc("GET /health", healthHandler)
 	mux.HandleFunc("GET /metrics", metricsHandler)
 	mux.HandleFunc("GET /tasks", getTasksHandler)
 	mux.HandleFunc("POST /tasks", createTasksHandler)
 
-	// Обертка для обработки неизвестных путей (404)
-	rootHandler := http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-		// Проверяем, совпадает ли запрос с зарегистрированными маршрутами
-		_, pattern := mux.Handler(r)
-		if pattern == "" {
-			w.Header().Set("Content-Type", "application/json")
-			w.WriteHeader(http.StatusNotFound)
-			w.Write([]byte(`{"error":"Not Found"}`))
-			return
-		}
-		mux.ServeHTTP(w, r)
-	})
-
-	fmt.Println("Сервер запущен на порту :8080...")
-	if err := http.ListenAndServe(":8080", rootHandler); err != nil {
-		fmt.Printf("Ошибка запуска сервера: %v\n", err)
+	log.Println("server on :8080")
+	if err := http.ListenAndServe(":8080", mux); err != nil {
+		log.Fatalf("listen: %v", err)
 	}
 }
 
-// GET /health
 func healthHandler(w http.ResponseWriter, r *http.Request) {
 	w.Header().Set("Content-Type", "application/json")
-	w.WriteHeader(http.StatusOK)
 	w.Write([]byte(`{"status":"ok"}`))
 }
 
-// GET /metrics
 func metricsHandler(w http.ResponseWriter, r *http.Request) {
-	w.Header().Set("Content-Type", "text/plain; version=0.0.4")
-	w.WriteHeader(http.StatusOK)
-	w.Write([]byte("# HELP http_requests_total Total number of HTTP requests.\n# TYPE http_requests_total counter\nhttp_requests_total 0\n"))
+	w.Header().Set("Content-Type", "text/plain")
+	w.Write([]byte("# placeholder\n"))
 }
 
-// GET /tasks
 func getTasksHandler(w http.ResponseWriter, r *http.Request) {
 	w.Header().Set("Content-Type", "application/json")
-	
-	tasksMu.Lock()
-	defer tasksMu.Unlock()
 
-	w.WriteHeader(http.StatusOK)
+	rows, err := db.QueryContext(r.Context(), `SELECT id, title FROM tasks ORDER BY id`)
+	if err != nil {
+		http.Error(w, `{"error":"db query failed"}`, 500)
+		return
+	}
+	defer rows.Close()
+
+	tasks := []Task{}
+	for rows.Next() {
+		var t Task
+		if err := rows.Scan(&t.ID, &t.Title); err != nil {
+			http.Error(w, `{"error":"scan failed"}`, 500)
+			return
+		}
+		tasks = append(tasks, t)
+	}
 	json.NewEncoder(w).Encode(tasks)
 }
 
-// POST /tasks
 func createTasksHandler(w http.ResponseWriter, r *http.Request) {
 	w.Header().Set("Content-Type", "application/json")
+	defer r.Body.Close()
 
 	var input struct {
 		Title string `json:"title"`
 	}
-
-	// Декодируем входящий JSON
 	if err := json.NewDecoder(r.Body).Decode(&input); err != nil {
-		w.WriteHeader(http.StatusBadRequest)
-		w.Write([]byte(`{"error":"Invalid JSON structure"}`))
+		w.WriteHeader(400)
+		w.Write([]byte(`{"error":"invalid JSON"}`))
 		return
 	}
-
-	// Валидация: пустой или отсутствующий title
 	if strings.TrimSpace(input.Title) == "" {
-		w.WriteHeader(http.StatusBadRequest)
-		w.Write([]byte(`{"error":"Title is required and cannot be empty"}`))
+		w.WriteHeader(400)
+		w.Write([]byte(`{"error":"title required"}`))
 		return
 	}
 
-	// Безопасное добавление в in-memory слайс
-	tasksMu.Lock()
-	newTask := Task{
-		ID:    nextID,
-		Title: input.Title,
+	var newID int
+	err := db.QueryRowContext(r.Context(),
+		`INSERT INTO tasks (title) VALUES ($1) RETURNING id`,
+		input.Title,
+	).Scan(&newID)
+	if err != nil {
+		http.Error(w, `{"error":"insert failed"}`, 500)
+		return
 	}
-	nextID++
-	tasks = append(tasks, newTask)
-	tasksMu.Unlock()
 
-	w.WriteHeader(http.StatusCreated)
-	json.NewEncoder(w).Encode(newTask)
+	w.WriteHeader(201)
+	json.NewEncoder(w).Encode(Task{ID: newID, Title: input.Title})
 }
-
