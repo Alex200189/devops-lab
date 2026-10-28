@@ -12,6 +12,10 @@ services:
         condition: service_healthy
     healthcheck:
       test: ["CMD", "wget", "-q", "-O-", "http://localhost:8080/health"]
+      interval: 10s
+      timeout: 3s
+      retries: 3
+      start_period: 10s
     cpus: '0.5'       
     mem_limit: 128M
 
@@ -21,7 +25,6 @@ services:
       POSTGRES_USER: "${POSTGRES_USER}"
       POSTGRES_PASSWORD: "${POSTGRES_PASSWORD}"
       POSTGRES_DB: "${POSTGRES_DB}"
-      POSTGRES_PORT: "${POSTGRES_PORT}"
     volumes:
       - postgres_data:/var/lib/postgresql/data
     healthcheck:
@@ -35,9 +38,6 @@ services:
   redis:
     image: redis:7-alpine
     command: redis-server --requirepass ${REDIS_PASSWORD}
-    environment:
-      REDIS_PASSWORD: "${REDIS_PASSWORD}"
-      REDIS_PORT: "${REDIS_PORT}"
     healthcheck:
       test: ["CMD", "redis-cli", "-a", "${REDIS_PASSWORD}", "ping"]
       interval: 3s      
