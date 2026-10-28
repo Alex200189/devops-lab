@@ -1,6 +1,7 @@
 package main
 
 import (
+	"context"
 	"database/sql"
 	"encoding/json"
 	"fmt"
@@ -11,6 +12,7 @@ import (
 	"time"
 
 	_ "github.com/jackc/pgx/v5/stdlib"
+	"github.com/redis/go-redis/v9"
 )
 
 type Task struct {
@@ -18,10 +20,13 @@ type Task struct {
 	Title string `json:"title"`
 }
 
-var db *sql.DB
+var (
+	db  *sql.DB
+	rdb *redis.Client
+)
 
 func main() {
-	// DSN: host=postgres — это имя сервиса в docker-compose
+	// ---------- Postgres ----------
 	dsn := fmt.Sprintf("postgres://%s:%s@postgres:5432/%s?sslmode=disable",
 		os.Getenv("POSTGRES_USER"),
 		os.Getenv("POSTGRES_PASSWORD"),
@@ -33,21 +38,23 @@ func main() {
 	if err != nil {
 		log.Fatalf("open db: %v", err)
 	}
+	defer db.Close()
 
 	// Retry: ждём, пока Postgres поднимется
+	connected := false
 	for i := 1; i <= 10; i++ {
 		if err = db.Ping(); err == nil {
 			log.Println("db connected")
+			connected = true
 			break
 		}
 		log.Printf("db ping attempt %d/10 failed: %v", i, err)
 		time.Sleep(1 * time.Second)
 	}
-	if err != nil {
+	if !connected {
 		log.Fatalf("db not reachable: %v", err)
 	}
 
-	// Создаём таблицу, если её нет
 	_, err = db.Exec(`CREATE TABLE IF NOT EXISTS tasks (
 		id SERIAL PRIMARY KEY,
 		title TEXT NOT NULL
@@ -56,6 +63,19 @@ func main() {
 		log.Fatalf("create table: %v", err)
 	}
 
+	// ---------- Redis ----------
+	rdb = redis.NewClient(&redis.Options{
+		Addr:     "redis:6379",
+		Password: os.Getenv("REDIS_PASSWORD"),
+	})
+
+	if err := rdb.Ping(context.Background()).Err(); err != nil {
+		log.Printf("redis ping failed: %v", err)
+	} else {
+		log.Println("redis connected")
+	}
+
+	// ---------- HTTP ----------
 	mux := http.NewServeMux()
 	mux.HandleFunc("GET /health", healthHandler)
 	mux.HandleFunc("GET /metrics", metricsHandler)
@@ -126,6 +146,11 @@ func createTasksHandler(w http.ResponseWriter, r *http.Request) {
 	if err != nil {
 		http.Error(w, `{"error":"insert failed"}`, 500)
 		return
+	}
+
+	// Redis: счётчик созданных задач. Ошибка НЕ валит запрос.
+	if err := rdb.Incr(r.Context(), "tasks_created_total").Err(); err != nil {
+		log.Printf("redis incr failed: %v", err)
 	}
 
 	w.WriteHeader(201)
